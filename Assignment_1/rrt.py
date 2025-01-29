@@ -1,7 +1,7 @@
 from typing import List, Tuple, Dict
 from collections import defaultdict
-import random
 from utilities import Point3D, PathRequest
+import torch
 
 
 class Node:
@@ -16,7 +16,8 @@ class Node:
 
 class TemporalRRTPlanner:
     def __init__(self, bounds: Tuple[int, int, int], velocity: float):
-        self.bounds = bounds
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.bounds = torch.tensor(bounds, dtype=torch.float32, device=self.device)
         self.velocity = velocity
         self.step_size = 5.0
         self.max_iterations = 10000
@@ -26,9 +27,8 @@ class TemporalRRTPlanner:
         return 0 <= point.x <= self.bounds[0] and 0 <= point.y <= self.bounds[1] and 0 <= point.z <= self.bounds[2]
 
     def _random_point(self) -> Point3D:
-        return Point3D(
-            random.uniform(0, self.bounds[0]), random.uniform(0, self.bounds[1]), random.uniform(0, self.bounds[2])
-        )
+        random_point = torch.rand(3, device=self.device) * self.bounds
+        return Point3D(*random_point.tolist())
 
     def _nearest_node(self, nodes: List[Node], point: Point3D) -> Node:
         return min(nodes, key=lambda n: n.point.distance_to(point))
@@ -81,55 +81,134 @@ class TemporalRRTPlanner:
         return list(reversed(path))
 
     def plan_path(self, request: PathRequest) -> List[Tuple[Point3D, float]]:
+        start_tensor = request.start.to_tensor()
+        end_tensor = request.end.to_tensor()
+
         nodes = [Node(request.start, None, request.start_time)]
+        node_tensors = torch.stack([start_tensor])
 
-        for _ in range(self.max_iterations):
-            if random.random() < 0.1:
-                random_point = request.end  # Bias towards goal
-            else:
-                random_point = self._random_point()
+        batch_size = 1000
 
-            nearest_node = self._nearest_node(nodes, random_point)
-            new_point = self._steer(nearest_node.point, random_point)
+        for _ in range(0, self.max_iterations, batch_size):
+            random_tensors = torch.rand((batch_size, 3), device=self.device) * self.bounds.unsqueeze(0)
 
-            if self._is_valid_point(new_point) and self._is_collision_free(nearest_node, new_point):
-                travel_time = nearest_node.point.distance_to(new_point) / self.velocity
-                new_node = Node(new_point, nearest_node, nearest_node.time + travel_time)
+            # Apply goal bias
+            goal_mask = torch.rand(batch_size, device=self.device) < 0.1
+            random_tensors[goal_mask] = end_tensor
+
+            # Find nearest nodes for all random points at once
+            distances = torch.cdist(random_tensors, node_tensors)
+            nearest_indices = torch.argmin(distances, dim=1)
+            nearest_positions = node_tensors[nearest_indices]
+
+            # Vectorized steering
+            directions = random_tensors - nearest_positions
+            distances = torch.norm(directions, dim=1, keepdim=True)
+            mask = distances > self.step_size
+            new_points = nearest_positions + directions * mask.float() * (
+                self.step_size / torch.clamp(distances, min=1e-6)
+            )
+
+            # Validate points in batch
+            valid_mask = torch.all((new_points >= 0) & (new_points <= self.bounds), dim=1)
+
+            # Collision checking in batch
+            nearest_times = torch.tensor([nodes[i].time for i in nearest_indices], device=self.device)
+            travel_times = torch.norm(new_points - nearest_positions, dim=1) / self.velocity
+
+            # Generate interpolated positions for collision checking
+            steps = 10
+            t = torch.linspace(0, 1, steps, device=self.device).unsqueeze(1).unsqueeze(0)
+            interpolated_positions = nearest_positions.unsqueeze(1) + (new_points - nearest_positions).unsqueeze(1) * t
+            interpolated_times = nearest_times.unsqueeze(1) + travel_times.unsqueeze(1) * t
+
+            # Round positions and times for collision checking
+            positions_rounded = torch.round(interpolated_positions)
+            times_rounded = torch.round(interpolated_times * 10) / 10
+
+            # Vectorized collision checking
+            collision_free = torch.ones(batch_size, dtype=torch.bool, device=self.device)
+            # pos_time_pairs = torch.cat([positions_rounded.reshape(-1, 3), times_rounded.reshape(-1, 1)], dim=1)
+
+            # Convert occupied space-time to tensor format for batch checking
+            if len(self.occupied_space_time) > 0:
+                # occupied_positions = torch.tensor(list(self.occupied_space_time.keys()), device=self.device)
+                # occupied_times = torch.tensor(
+                #     [list(times) for times in self.occupied_space_time.values()], device=self.device
+                # )
+
+                # Check collisions for all points and times
+                for i in range(batch_size):
+                    if valid_mask[i]:
+                        pos_sequence = positions_rounded[i]
+                        time_sequence = times_rounded[i]
+
+                        for j in range(steps):
+                            pos = tuple(pos_sequence[j].cpu().numpy())
+                            time = time_sequence[j].item()
+
+                            if pos in self.occupied_space_time and time in self.occupied_space_time[pos]:
+                                collision_free[i] = False
+                                break
+
+            valid_indices = torch.where(valid_mask & collision_free)[0]
+            for idx in valid_indices:
+                new_point = Point3D.from_tensor(new_points[idx])
+                parent_idx = nearest_indices[idx]
+                travel_time = travel_times[idx].item()
+                new_node = Node(new_point, nodes[parent_idx], nodes[parent_idx].time + travel_time)
                 nodes.append(new_node)
+                node_tensors = torch.cat([node_tensors, new_points[idx].unsqueeze(0)])
 
-                # Check if close to goal
-                if new_point.distance_to(request.end) < self.step_size:
-                    final_node = Node(
-                        request.end, new_node, new_node.time + new_point.distance_to(request.end) / self.velocity
-                    )
+                # Check if goal reached
+                if torch.norm(new_points[idx] - end_tensor) < self.step_size:
+                    final_travel_time = torch.norm(end_tensor - new_points[idx]) / self.velocity
+                    final_node = Node(request.end, new_node, new_node.time + final_travel_time.item())
 
+                    # Verify final path for collisions
                     if self._is_collision_free(new_node, request.end):
                         path = self._reconstruct_path(final_node)
 
-                        # Mark path in occupied space-time
-                        for i in range(len(path) - 1):
-                            p1, t1 = path[i]
-                            p2, t2 = path[i + 1]
-
-                            steps = int((t2 - t1) * 10)  # Check every 0.1 seconds
-                            if steps < 1:
-                                steps = 1
-
-                            for step in range(steps + 1):
-                                t = t1 + (t2 - t1) * step / steps
-                                ratio = step / steps
-
-                                x = p1.x + (p2.x - p1.x) * ratio
-                                y = p1.y + (p2.y - p1.y) * ratio
-                                z = p1.z + (p2.z - p1.z) * ratio
-
-                                point_key = (round(x), round(y), round(z))
-                                time_key = round(t * 10) / 10
-                                self.occupied_space_time[point_key].add(time_key)
-
+                        self._update_occupied_space_time(path)
                         return path
 
         raise Exception("Failed to find path within iteration limit")
+
+    def _update_occupied_space_time(self, path: List[Tuple[Point3D, float]]):
+        import torch
+
+        """Efficiently update occupied space-time using tensor operations"""
+        if len(path) < 2:
+            return
+
+        points = torch.stack([point.to_tensor() for point, _ in path])
+        times = torch.tensor([time for _, time in path], device=points.device)
+
+        # Generate interpolation points for all segments at once
+        segments = torch.stack([points[:-1], points[1:]], dim=1)
+        time_segments = torch.stack([times[:-1], times[1:]], dim=1)
+
+        steps = 10
+        t = torch.linspace(0, 1, steps, device=points.device).unsqueeze(1)
+
+        # Interpolate all segments simultaneously
+        interpolated_points = segments[:, 0].unsqueeze(1) + (segments[:, 1] - segments[:, 0]).unsqueeze(1) * t
+        interpolated_times = (
+            time_segments[:, 0].unsqueeze(1) + (time_segments[:, 1] - time_segments[:, 0]).unsqueeze(1) * t
+        )
+
+        # Round positions and times
+        positions_rounded = torch.round(interpolated_points)
+        times_rounded = torch.round(interpolated_times * 10) / 10
+
+        for i in range(len(path) - 1):
+            for j in range(steps):
+                pos = tuple(positions_rounded[i, j].cpu().numpy())
+                time = times_rounded[i, j].item()
+
+                if pos not in self.occupied_space_time:
+                    self.occupied_space_time[pos] = set()
+                self.occupied_space_time[pos].add(time)
 
 
 def plan_multiple_paths(
