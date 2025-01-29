@@ -1,78 +1,148 @@
-import numpy as np
+from typing import List, Tuple, Dict
+from collections import defaultdict
+import random
+from utilities import Point3D, PathRequest
 
 
 class Node:
-    def __init__(self, position, time):
-        self.position = np.array(position)
+    def __init__(self, point: Point3D, parent=None, time=0.0):
+        self.point = point
+        self.parent = parent
         self.time = time
-        self.parent = None
+
+    def distance_to(self, other: "Node") -> float:
+        return self.point.distance_to(other.point)
 
 
-class RRT:
-    def __init__(self, start, goal, v, start_time):
-        self.start = start
-        self.goal = goal
-        self.v = v 
-        self.start_time = start_time
-        self.nodes = [Node(start, start_time)]
-        self.goal_node = None
-        self.max_iter = 1000
-        self.step_size = 10  
+class TemporalRRTPlanner:
+    def __init__(self, bounds: Tuple[int, int, int], velocity: float):
+        self.bounds = bounds
+        self.velocity = velocity
+        self.step_size = 5.0
+        self.max_iterations = 10000
+        self.occupied_space_time = defaultdict(set)
 
-    def distance(self, node1, node2):
-        return np.linalg.norm(node1.position - node2.position)
+    def _is_valid_point(self, point: Point3D) -> bool:
+        return 0 <= point.x <= self.bounds[0] and 0 <= point.y <= self.bounds[1] and 0 <= point.z <= self.bounds[2]
 
-    def nearest_node(self, new_position):
-        distances = [self.distance(node, Node(new_position, 0)) for node in self.nodes]
-        return self.nodes[np.argmin(distances)]
+    def _random_point(self) -> Point3D:
+        return Point3D(
+            random.uniform(0, self.bounds[0]), random.uniform(0, self.bounds[1]), random.uniform(0, self.bounds[2])
+        )
 
-    def steer(self, from_node, to_position):
-        direction = np.array(to_position) - from_node.position
-        length = np.linalg.norm(direction)
-        if length == 0:
-            return from_node  # Avoid division by zero
-        travel_time = length / self.v
-        direction = (direction / length) * min(self.step_size, length)
-        new_position = from_node.position + direction
+    def _nearest_node(self, nodes: List[Node], point: Point3D) -> Node:
+        return min(nodes, key=lambda n: n.point.distance_to(point))
+
+    def _steer(self, from_point: Point3D, to_point: Point3D) -> Point3D:
+        dist = from_point.distance_to(to_point)
+        if dist <= self.step_size:
+            return to_point
+
+        ratio = self.step_size / dist
+        new_x = from_point.x + (to_point.x - from_point.x) * ratio
+        new_y = from_point.y + (to_point.y - from_point.y) * ratio
+        new_z = from_point.z + (to_point.z - from_point.z) * ratio
+
+        return Point3D(new_x, new_y, new_z)
+
+    def _is_collision_free(self, from_node: Node, to_point: Point3D) -> bool:
+        # Check if path segments intersect with occupied space-time
+        travel_time = from_node.point.distance_to(to_point) / self.velocity
         new_time = from_node.time + travel_time
-        new_node = Node(new_position, new_time)
-        new_node.parent = from_node
-        return new_node
 
-    def plan(self):
-        for _ in range(self.max_iter):
-            rand_pos = np.random.randint(0, 101, size=3)  # Random position within 0-100 grid
-            nearest = self.nearest_node(rand_pos)
-            new_node = self.steer(nearest, rand_pos)
+        # Discretize the path and check for collisions
+        steps = int(travel_time * 10)  # Check every 0.1 seconds
+        if steps < 1:
+            steps = 1
 
-            # Check for collision in space-time
-            if not self.is_collision_free(new_node):
-                continue
+        for i in range(steps + 1):
+            t = from_node.time + (travel_time * i / steps)
+            ratio = i / steps
 
-            self.nodes.append(new_node)
+            x = from_node.point.x + (to_point.x - from_node.point.x) * ratio
+            y = from_node.point.y + (to_point.y - from_node.point.y) * ratio
+            z = from_node.point.z + (to_point.z - from_node.point.z) * ratio
 
-            if self.distance(new_node, Node(self.goal, 0)) < self.step_size:
-                self.goal_node = new_node
-                break
+            # Check if point at time t is occupied
+            point_key = (round(x), round(y), round(z))
+            time_key = round(t * 10) / 10  # Round to nearest 0.1s
 
-        if self.goal_node:
-            return self.extract_path()
-        else:
-            return None
-
-    def is_collision_free(self, node):
-        for n in self.nodes:
-            # Check if new node is too close in space and time
-            if np.linalg.norm(node.position - n.position) < self.step_size and abs(node.time - n.time) < (
-                self.step_size / self.v
-            ):
+            if time_key in self.occupied_space_time[point_key]:
                 return False
+
         return True
 
-    def extract_path(self):
+    def _reconstruct_path(self, final_node: Node) -> List[Tuple[Point3D, float]]:
         path = []
-        current = self.goal_node
+        current = final_node
         while current is not None:
-            path.append([*current.position, current.time])
+            path.append((current.point, current.time))
             current = current.parent
-        return path[::-1]  # Reverse to get from start to goal
+        return list(reversed(path))
+
+    def plan_path(self, request: PathRequest) -> List[Tuple[Point3D, float]]:
+        nodes = [Node(request.start, None, request.start_time)]
+
+        for _ in range(self.max_iterations):
+            if random.random() < 0.1:
+                random_point = request.end  # Bias towards goal
+            else:
+                random_point = self._random_point()
+
+            nearest_node = self._nearest_node(nodes, random_point)
+            new_point = self._steer(nearest_node.point, random_point)
+
+            if self._is_valid_point(new_point) and self._is_collision_free(nearest_node, new_point):
+                travel_time = nearest_node.point.distance_to(new_point) / self.velocity
+                new_node = Node(new_point, nearest_node, nearest_node.time + travel_time)
+                nodes.append(new_node)
+
+                # Check if close to goal
+                if new_point.distance_to(request.end) < self.step_size:
+                    final_node = Node(
+                        request.end, new_node, new_node.time + new_point.distance_to(request.end) / self.velocity
+                    )
+
+                    if self._is_collision_free(new_node, request.end):
+                        path = self._reconstruct_path(final_node)
+
+                        # Mark path in occupied space-time
+                        for i in range(len(path) - 1):
+                            p1, t1 = path[i]
+                            p2, t2 = path[i + 1]
+
+                            steps = int((t2 - t1) * 10)  # Check every 0.1 seconds
+                            if steps < 1:
+                                steps = 1
+
+                            for step in range(steps + 1):
+                                t = t1 + (t2 - t1) * step / steps
+                                ratio = step / steps
+
+                                x = p1.x + (p2.x - p1.x) * ratio
+                                y = p1.y + (p2.y - p1.y) * ratio
+                                z = p1.z + (p2.z - p1.z) * ratio
+
+                                point_key = (round(x), round(y), round(z))
+                                time_key = round(t * 10) / 10
+                                self.occupied_space_time[point_key].add(time_key)
+
+                        return path
+
+        raise Exception("Failed to find path within iteration limit")
+
+
+def plan_multiple_paths(
+    requests: List[PathRequest], bounds: Tuple[int, int, int], velocity: float
+) -> Dict[int, List[Tuple[Point3D, float]]]:
+    planner = TemporalRRTPlanner(bounds, velocity)
+    paths = {}
+
+    for i, request in enumerate(requests):
+        try:
+            path = planner.plan_path(request)
+            paths[i] = path
+        except Exception as e:
+            print(f"Failed to plan path {i}: {str(e)}")
+
+    return paths
